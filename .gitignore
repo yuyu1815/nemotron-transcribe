@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Environments, model files and generated outputs
+.venv/
+.cache/
+.models/
+.runtime/
+.pi/
+.setup-*/
+transcripts/
+*.transcript.json
+*.speakers.json
+*.transcript.log
+*.speakers.log

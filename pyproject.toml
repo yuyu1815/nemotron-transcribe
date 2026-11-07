@@ -1,0 +1,25 @@
+[project]
+name = "nemotron-transcribe"
+version = "0.1.0"
+description = "Japanese transcription with speaker diarization"
+requires-python = "==3.12.*"
+dependencies = [
+    "huggingface-hub>=1",
+    "librosa>=1.0.0",
+    "rocm",
+    "rocm-sdk-core",
+    "rocm-sdk-devel",
+    "rocm-sdk-libraries-custom",
+    "soundfile>=0.14.0",
+    "torch",
+    "transformers",
+    "yt-dlp>=2026.10.26",
+]
+
+[tool.uv.sources]
+torch = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl" }
+rocm = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm-7.2.1.tar.gz" }
+rocm-sdk-core = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_core-7.2.1-py3-none-win_amd64.whl" }
+rocm-sdk-devel = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl" }
+rocm-sdk-libraries-custom = { url = "https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl" }
+transformers = { git = "https://github.com/huggingface/transformers" }

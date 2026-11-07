@@ -1,0 +1,28 @@
+[tools]
+python = "3.12"
+uv = "0.11.14"
+
+[env]
+_.path = ["{{env.LOCALAPPDATA}}/Microsoft/WinGet/Links"]
+
+[tasks.setup]
+description = "依存関係・モデル・GPU実行体を準備"
+quiet = true
+run = "python bootstrap.py"
+
+[tasks.transcribe]
+description = "音声を話者付きで文字起こし"
+quiet = true
+run = "uv run --locked python reazonspeech_diarize.py"
+
+[tasks.test]
+description = "動作チェック"
+run = [
+    "uv run --locked python test_reazonspeech_diarize.py",
+    "uv run --locked python test_diarization_coverage.py",
+    "uv run --locked python test_setup_project.py",
+]
+
+[tasks."test:e2e"]
+description = "GPUを使った結合テスト"
+run = "uv run --locked python test_reazonspeech_diarize.py --e2e"
