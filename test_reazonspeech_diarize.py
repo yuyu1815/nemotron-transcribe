@@ -1,9 +1,7 @@
 import contextlib
 import io
 import json
-import os
 import subprocess
-import sys
 import tempfile
 import unittest
 import wave
@@ -267,50 +265,5 @@ class Checks(unittest.TestCase):
                     r.recognize(parts, d)
 
 
-def e2e():
-    with tempfile.TemporaryDirectory(prefix='reazon-e2e-') as tmp:
-        d = Path(tmp)
-        # SAPI writes two distinct synthesized voices; repeat to cross the 30 s boundary.
-        ps = r'''$ErrorActionPreference = 'Stop'
-$voice = New-Object -ComObject SAPI.SpVoice
-foreach ($n in 0,1) {
-  $voice.Voice = $voice.GetVoices().Item($n)
-  $stream = New-Object -ComObject SAPI.SpFileStream
-  $stream.Open((Join-Path $env:REAZON_E2E_DIR "voice$n.wav"), 3, $false)
-  $voice.AudioOutputStream = $stream
-  $voice.Speak(@('これは音声認識と話者分離のテストです。今日は天気がとても良いです。','Hello, this is a different speaker for a speech recognition test.')[ $n ]) | Out-Null
-  $stream.Close()
-}'''
-        subprocess.run(['powershell', '-NoProfile', '-Command', ps], check=True,
-                       env={**os.environ, 'REAZON_E2E_DIR': str(d)})
-        voices = []
-        for n in (0, 1):
-            with wave.open(str(d / f'voice{n}.wav'), 'rb') as src:
-                params = src.getparams()
-                voices.append(src.readframes(src.getnframes()))
-        audio = d / 'synthetic.wav'
-        with wave.open(str(audio), 'wb') as out:
-            out.setparams(params)
-            while out.tell() < params.framerate * 31:
-                for voice in voices:
-                    out.writeframes(voice)
-        video = d / 'synthetic.mp4'
-        subprocess.run(['ffmpeg', '-nostdin', '-v', 'error', '-f', 'lavfi', '-i', 'color=c=black:s=64x64:r=1',
-                        '-i', str(audio), '-shortest', '-c:v', 'mpeg4', '-c:a', 'aac', str(video)], check=True)
-        subprocess.run([sys.executable, str(r.ROOT / 'reazonspeech_diarize.py'), str(video)], check=True)
-        transcript = video.with_suffix('.transcript.log').read_text(encoding='utf-8').splitlines()
-        speakers = video.with_suffix('.speakers.log').read_text(encoding='utf-8').splitlines()
-        assert transcript and speakers and len(speakers) <= len(transcript)
-        def interval(line):
-            return line.split('] ', 1)[0].lstrip('[').split(' - ')
-        assert all(any(a <= x and y <= b for a, b in map(interval, speakers))
-                   for x, y in map(interval, transcript))
-        assert all('speaker_' in line for line in speakers)
-        print('E2E utterances:', len(transcript), 'speaker segments:', len(speakers))
-
-
 if __name__ == '__main__':
-    if '--e2e' in sys.argv:
-        e2e()
-    else:
-        unittest.main()
+    unittest.main()

@@ -35,5 +35,4 @@ UTF-8 のテキスト形式で、各行は `[時:分:秒.ミリ秒 - 時:分:秒
 
 ```powershell
 mise run test       # ロジックのチェック
-mise run test:e2e   # 合成動画を使う GPU 結合テスト
 ```

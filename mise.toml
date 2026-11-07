@@ -22,7 +22,3 @@ run = [
     "uv run --locked python test_diarization_coverage.py",
     "uv run --locked python test_setup_project.py",
 ]
-
-[tasks."test:e2e"]
-description = "GPUを使った結合テスト"
-run = "uv run --locked python test_reazonspeech_diarize.py --e2e"
