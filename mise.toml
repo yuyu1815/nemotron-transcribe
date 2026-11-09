@@ -10,15 +10,25 @@ description = "依存関係・モデル・GPU実行体を準備"
 quiet = true
 run = "python bootstrap.py"
 
-[tasks.transcribe]
-description = "音声を話者付きで文字起こし"
+[tasks.setup-asr-worker]
+description = "共有 ASR ワーカーだけを追加ビルド"
 quiet = true
-run = "uv run --locked python reazonspeech_diarize.py"
+run = "uv run --locked --no-sync python setup_project.py --asr-worker-only"
+
+[tasks.transcribe]
+description = "話者付き文字起こし・URL動画の場面画像を保存"
+quiet = true
+run = "uv run --locked python transcribe.py"
 
 [tasks.test]
 description = "動作チェック"
 run = [
-    "uv run --locked python test_reazonspeech_diarize.py",
+    "uv run --locked python test_transcribe.py",
+    "uv run --locked python test_video_sources.py",
+    "uv run --locked python test_progress.py",
+    "uv run --locked python test_scene_images.py",
     "uv run --locked python test_diarization_coverage.py",
     "uv run --locked python test_setup_project.py",
+    "uv run --locked python test_model_workers.py",
+    "uv run --locked python test_asr_worker_build.py",
 ]

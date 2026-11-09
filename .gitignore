@@ -11,6 +11,8 @@ wheels/
 .cache/
 .models/
 .runtime/
+output/
+.work/
 .pi/
 .setup-*/
 transcripts/

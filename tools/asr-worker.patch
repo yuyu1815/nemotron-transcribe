@@ -1,0 +1,235 @@
+diff --git a/sherpa-onnx/csrc/CMakeLists.txt b/sherpa-onnx/csrc/CMakeLists.txt
+index 5a74f86..e266786 100755
+--- a/sherpa-onnx/csrc/CMakeLists.txt
++++ b/sherpa-onnx/csrc/CMakeLists.txt
+@@ -361,6 +361,9 @@ endif()
+ # Always static build
+ add_library(sherpa-onnx-core STATIC ${sources})
+ 
++add_executable(asr-worker asr_worker.cc)
++target_link_libraries(asr-worker PRIVATE sherpa-onnx-core)
++
+ 
+ if(WIN32 AND SHERPA_ONNX_LINK_D3D)
+     target_link_libraries(sherpa-onnx-core dxguid.lib d3d12.lib dxgi.lib dxcore.lib)
+diff --git a/sherpa-onnx/csrc/offline-recognizer-impl.h b/sherpa-onnx/csrc/offline-recognizer-impl.h
+index 64d7df2..74386bf 100644
+--- a/sherpa-onnx/csrc/offline-recognizer-impl.h
++++ b/sherpa-onnx/csrc/offline-recognizer-impl.h
+@@ -6,6 +6,7 @@
+ #define SHERPA_ONNX_CSRC_OFFLINE_RECOGNIZER_IMPL_H_
+ 
+ #include <memory>
++#include <stdexcept>
+ #include <string>
+ #include <vector>
+ 
+@@ -33,6 +34,10 @@ class OfflineRecognizerImpl {
+ 
+   virtual ~OfflineRecognizerImpl() = default;
+ 
++  virtual std::vector<std::string> EndProfiling() {
++    throw std::runtime_error("EndProfiling is unsupported for this recognizer");
++  }
++
+   virtual std::unique_ptr<OfflineStream> CreateStream(
+       const std::string &hotwords) const {
+     SHERPA_ONNX_LOGE("Only transducer models support contextual biasing.");
+diff --git a/sherpa-onnx/csrc/offline-recognizer-transducer-impl.h b/sherpa-onnx/csrc/offline-recognizer-transducer-impl.h
+index 46198b2..b297d06 100644
+--- a/sherpa-onnx/csrc/offline-recognizer-transducer-impl.h
++++ b/sherpa-onnx/csrc/offline-recognizer-transducer-impl.h
+@@ -268,6 +268,10 @@ class OfflineRecognizerTransducerImpl : public OfflineRecognizerImpl {
+     }
+   }
+ 
++  std::vector<std::string> EndProfiling() override {
++    return model_->EndProfiling();
++  }
++
+   OfflineRecognizerConfig GetConfig() const override { return config_; }
+ 
+   void InitHotwords() {
+diff --git a/sherpa-onnx/csrc/offline-recognizer.cc b/sherpa-onnx/csrc/offline-recognizer.cc
+index c9d85ec..8515805 100644
+--- a/sherpa-onnx/csrc/offline-recognizer.cc
++++ b/sherpa-onnx/csrc/offline-recognizer.cc
+@@ -161,6 +161,10 @@ OfflineRecognizer::OfflineRecognizer(const OfflineRecognizerConfig &config)
+ 
+ OfflineRecognizer::~OfflineRecognizer() = default;
+ 
++std::vector<std::string> OfflineRecognizer::EndProfiling() {
++  return impl_->EndProfiling();
++}
++
+ std::unique_ptr<OfflineStream> OfflineRecognizer::CreateStream(
+     const std::string &hotwords) const {
+   return impl_->CreateStream(hotwords);
+diff --git a/sherpa-onnx/csrc/offline-recognizer.h b/sherpa-onnx/csrc/offline-recognizer.h
+index 1fcc101..9e49d0c 100644
+--- a/sherpa-onnx/csrc/offline-recognizer.h
++++ b/sherpa-onnx/csrc/offline-recognizer.h
+@@ -125,6 +125,9 @@ class OfflineRecognizer {
+ 
+   OfflineRecognizerConfig GetConfig() const;
+ 
++  // Stop profiling the resident sessions without replacing them.
++  std::vector<std::string> EndProfiling();
++
+  private:
+   std::unique_ptr<OfflineRecognizerImpl> impl_;
+ };
+diff --git a/sherpa-onnx/csrc/offline-transducer-model.cc b/sherpa-onnx/csrc/offline-transducer-model.cc
+index b7fff5a..04a00a8 100644
+--- a/sherpa-onnx/csrc/offline-transducer-model.cc
++++ b/sherpa-onnx/csrc/offline-transducer-model.cc
+@@ -96,21 +96,20 @@ class OfflineTransducerModel::Impl {
+   explicit Impl(const OfflineModelConfig &config)
+       : config_(config),
+         env_(ORT_LOGGING_LEVEL_ERROR),
+-        sess_opts_(GetSessionOptions(config)),
+         allocator_{} {
+     encoder_sess_ = std::make_unique<Ort::Session>(
+         env_, SHERPA_ONNX_TO_ORT_PATH(config.transducer.encoder_filename),
+-        sess_opts_);
++        GetSessionOptions(config_));
+     InitEncoder(nullptr, 0);
+ 
+     decoder_sess_ = std::make_unique<Ort::Session>(
+         env_, SHERPA_ONNX_TO_ORT_PATH(config.transducer.decoder_filename),
+-        sess_opts_);
++        GetSessionOptions(config_));
+     InitDecoder(nullptr, 0);
+ 
+     joiner_sess_ = std::make_unique<Ort::Session>(
+         env_, SHERPA_ONNX_TO_ORT_PATH(config.transducer.joiner_filename),
+-        sess_opts_);
++        GetSessionOptions(config_));
+     InitJoiner(nullptr, 0);
+   }
+ 
+@@ -118,7 +117,6 @@ class OfflineTransducerModel::Impl {
+   Impl(Manager *mgr, const OfflineModelConfig &config)
+       : config_(config),
+         env_(ORT_LOGGING_LEVEL_ERROR),
+-        sess_opts_(GetSessionOptions(config)),
+         allocator_{} {
+     {
+       auto buf = ReadFile(mgr, config.transducer.encoder_filename);
+@@ -173,6 +171,16 @@ class OfflineTransducerModel::Impl {
+     return std::move(logit[0]);
+   }
+ 
++  std::vector<std::string> EndProfiling() {
++    std::vector<std::string> paths;
++    for (auto *session : {encoder_sess_.get(), decoder_sess_.get(),
++                          joiner_sess_.get()}) {
++      auto path = session->EndProfilingAllocated(allocator_);
++      paths.emplace_back(path.get());
++    }
++    return paths;
++  }
++
+   int32_t VocabSize() const { return vocab_size_; }
+   int32_t ContextSize() const { return context_size_; }
+   int32_t SubsamplingFactor() const { return 4; }
+@@ -229,7 +237,7 @@ class OfflineTransducerModel::Impl {
+   void InitEncoder(void *model_data, size_t model_data_length) {
+     if (model_data) {
+       encoder_sess_ = std::make_unique<Ort::Session>(
+-          env_, model_data, model_data_length, sess_opts_);
++          env_, model_data, model_data_length, GetSessionOptions(config_));
+     } else if (!encoder_sess_) {
+       SHERPA_ONNX_LOGE(
+           "Please pass model data or initialize the encoder session outside of "
+@@ -270,7 +278,7 @@ class OfflineTransducerModel::Impl {
+   void InitDecoder(void *model_data, size_t model_data_length) {
+     if (model_data) {
+       decoder_sess_ = std::make_unique<Ort::Session>(
+-          env_, model_data, model_data_length, sess_opts_);
++          env_, model_data, model_data_length, GetSessionOptions(config_));
+     } else if (!decoder_sess_) {
+       SHERPA_ONNX_LOGE(
+           "Please pass model data or initialize the decoder session outside of "
+@@ -307,7 +315,7 @@ class OfflineTransducerModel::Impl {
+   void InitJoiner(void *model_data, size_t model_data_length) {
+     if (model_data) {
+       joiner_sess_ = std::make_unique<Ort::Session>(
+-          env_, model_data, model_data_length, sess_opts_);
++          env_, model_data, model_data_length, GetSessionOptions(config_));
+     } else if (!joiner_sess_) {
+       SHERPA_ONNX_LOGE(
+           "Please pass model data or initialize the joiner session outside of "
+@@ -334,7 +342,6 @@ class OfflineTransducerModel::Impl {
+  private:
+   OfflineModelConfig config_;
+   Ort::Env env_;
+-  Ort::SessionOptions sess_opts_;
+   Ort::AllocatorWithDefaultOptions allocator_;
+ 
+   std::unique_ptr<Ort::Session> encoder_sess_;
+@@ -378,6 +385,10 @@ OfflineTransducerModel::OfflineTransducerModel(Manager *mgr,
+ 
+ OfflineTransducerModel::~OfflineTransducerModel() = default;
+ 
++std::vector<std::string> OfflineTransducerModel::EndProfiling() {
++  return impl_->EndProfiling();
++}
++
+ std::pair<Ort::Value, Ort::Value> OfflineTransducerModel::RunEncoder(
+     Ort::Value features, Ort::Value features_length) {
+   return impl_->RunEncoder(std::move(features), std::move(features_length));
+diff --git a/sherpa-onnx/csrc/offline-transducer-model.h b/sherpa-onnx/csrc/offline-transducer-model.h
+index e8ca93a..f8eb62d 100644
+--- a/sherpa-onnx/csrc/offline-transducer-model.h
++++ b/sherpa-onnx/csrc/offline-transducer-model.h
+@@ -25,6 +25,8 @@ class OfflineTransducerModel {
+ 
+   ~OfflineTransducerModel();
+ 
++  std::vector<std::string> EndProfiling();
++
+   /** Run the encoder.
+    *
+    * @param features  A tensor of shape (N, T, C). It is changed in-place.
+diff --git a/sherpa-onnx/csrc/session.cc b/sherpa-onnx/csrc/session.cc
+index e7ef4dc..0d63b15 100644
+--- a/sherpa-onnx/csrc/session.cc
++++ b/sherpa-onnx/csrc/session.cc
+@@ -5,6 +5,8 @@
+ #include "sherpa-onnx/csrc/session.h"
+ 
+ #include <algorithm>
++#include <atomic>
++#include <stdexcept>
+ #include <fstream>
+ #include <sstream>
+ #include <string>
+@@ -249,8 +251,10 @@ Ort::SessionOptions GetSessionOptionsImpl(
+   }
+ 
+   if (config.find("ProfilingFilePrefix") != config.end()) {
+-    sess_opts.EnableProfiling(
+-        SHERPA_ONNX_TO_ORT_PATH(config["ProfilingFilePrefix"]));
++    static std::atomic<uint64_t> profile_id{0};
++    auto prefix = config["ProfilingFilePrefix"] + "-" +
++                  std::to_string(profile_id.fetch_add(1));
++    sess_opts.EnableProfiling(SHERPA_ONNX_TO_ORT_PATH(prefix));
+     config.erase("ProfilingFilePrefix");
+   }
+ 
+@@ -449,11 +453,12 @@ Ort::SessionOptions GetSessionOptionsImpl(
+       if (status) {
+         const auto &api = Ort::GetApi();
+         const char *msg = api.GetErrorMessage(status);
+-        SHERPA_ONNX_LOGE("Failed to enable DirectML: %s. Fallback to cpu", msg);
++        std::string error = std::string("Failed to enable DirectML: ") + msg;
+         api.ReleaseStatus(status);
++        throw std::runtime_error(error);
+       }
+ #else
+-      SHERPA_ONNX_LOGE("DirectML is for Windows only. Fallback to cpu!");
++      throw std::runtime_error("DirectML support is required");
+ #endif
+       break;
+     }

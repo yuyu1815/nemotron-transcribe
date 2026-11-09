@@ -1,11 +1,14 @@
 [project]
 name = "nemotron-transcribe"
 version = "0.1.0"
-description = "Japanese transcription with speaker diarization"
+description = "Japanese speaker transcription and video scene evidence"
 requires-python = "==3.12.*"
 dependencies = [
     "huggingface-hub>=1",
     "librosa>=1.0.0",
+    "numpy>=2",
+    "opencv-python>=4.11",
+    "rich>=15",
     "rocm",
     "rocm-sdk-core",
     "rocm-sdk-devel",

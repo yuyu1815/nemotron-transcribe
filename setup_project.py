@@ -1,7 +1,10 @@
 """Prepare the pinned models and Windows GPU runtime for this project."""
+import argparse
 import hashlib
 import json
 import os
+import re
+import stat
 import shutil
 import subprocess
 import sys
@@ -40,6 +43,17 @@ LEGACY_RUNTIME = {
     "dxgi.exe": "7441531a791e63574913a4937b04f98d05666d100cdeb2e8eabce664df0c553d",
 }
 CORE = ("sherpa-onnx-offline.exe", "onnxruntime.dll", "DirectML.dll")
+ASR_WORKER_FILES = ("asr-worker.exe", "onnxruntime.dll", "DirectML.dll")
+ASR_WORKER_INPUTS = ("tools/asr_worker.cc", "tools/asr-worker.patch")
+ASR_WORKER_CMAKE = (
+    "-DBUILD_SHARED_LIBS=ON", "-DSHERPA_ONNX_ENABLE_DIRECTML=ON",
+    "-DSHERPA_ONNX_ENABLE_BINARY=OFF", "-DSHERPA_ONNX_ENABLE_C_API=OFF",
+    "-DSHERPA_ONNX_USE_PRE_INSTALLED_ONNXRUNTIME_IF_AVAILABLE=OFF",
+    "-DSHERPA_ONNX_USE_STATIC_CRT=ON", "-DSHERPA_ONNX_ENABLE_PYTHON=OFF",
+    "-DSHERPA_ONNX_ENABLE_TESTS=OFF", "-DSHERPA_ONNX_ENABLE_TTS=OFF",
+    "-DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF", "-DSHERPA_ONNX_ENABLE_WEBSOCKET=OFF",
+    "-DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=OFF",
+)
 
 
 def digest(path):
@@ -47,6 +61,178 @@ def digest(path):
         return None
     with path.open("rb") as f:
         return hashlib.file_digest(f, "sha256").hexdigest()
+
+
+def asr_worker_recipe():
+    inputs = {name: digest(ROOT / name) for name in ASR_WORKER_INPUTS}
+    if not all(inputs.values()):
+        raise RuntimeError("Missing ASR worker source. Run mise run setup-asr-worker")
+    return {"v": 1, "fork_revision": FORK_REVISION, "onnxruntime": "1.24.4",
+            "directml": "1.15.4", "inputs": inputs, "cmake": list(ASR_WORKER_CMAKE)}
+
+
+def asr_worker_fingerprint(recipe):
+    return hashlib.sha256(json.dumps(recipe, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _plain_path(path, directory=False):
+    info = path.lstat()
+    if (stat.S_ISLNK(info.st_mode)
+            or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            or not (stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))):
+        raise ValueError(f"Not a plain {'directory' if directory else 'file'}: {path}")
+
+
+def _read_worker_json(path):
+    _plain_path(path)
+    if path.stat().st_size > 65536:
+        raise ValueError("Oversized ASR worker metadata")
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict):
+        raise ValueError("Invalid ASR worker metadata")
+    return value
+
+
+def _validate_asr_worker_child(runtime, name, recipe):
+    fingerprint = asr_worker_fingerprint(recipe)
+    if name != "asr-worker-" + fingerprint:
+        raise ValueError("Invalid or stale ASR worker directory")
+    _plain_path(runtime, directory=True)
+    child = runtime / name
+    _plain_path(child, directory=True)
+    if {p.name for p in child.iterdir()} != {*ASR_WORKER_FILES, "manifest.json"}:
+        raise ValueError("Unexpected ASR worker files")
+    manifest = _read_worker_json(child / "manifest.json")
+    if manifest.get("recipe") != recipe or manifest.get("fingerprint") != fingerprint or manifest.get("v") != 1:
+        raise ValueError("ASR worker recipe mismatch")
+    hashes = manifest.get("sha256")
+    if not isinstance(hashes, dict) or set(hashes) != set(ASR_WORKER_FILES):
+        raise ValueError("Invalid ASR worker hash manifest")
+    for filename in ASR_WORKER_FILES:
+        _plain_path(child / filename)
+        expected = hashes[filename]
+        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected) or digest(child / filename) != expected:
+            raise ValueError(f"ASR worker hash mismatch: {filename}")
+        if filename != "asr-worker.exe" and expected != LEGACY_RUNTIME[filename]:
+            raise ValueError(f"Unpinned ASR worker DLL: {filename}")
+    return child / "asr-worker.exe"
+
+
+def asr_worker_path(runtime: Path) -> Path:
+    """Resolve a verified additive artifact without loading any native library."""
+    try:
+        runtime = Path(runtime)
+        _plain_path(runtime, directory=True)
+        pointer = _read_worker_json(runtime / "asr-worker.json")
+        if pointer.get("v") != 1 or not isinstance(pointer.get("directory"), str):
+            raise ValueError("Invalid ASR worker pointer")
+        exe = _validate_asr_worker_child(runtime, pointer["directory"], asr_worker_recipe())
+        if pointer.get("manifest_sha256") != digest(exe.parent / "manifest.json"):
+            raise ValueError("ASR worker manifest hash mismatch")
+        return exe
+    except (OSError, ValueError, TypeError, KeyError) as error:
+        raise RuntimeError(f"ASR worker missing or invalid: {error}. Run mise run setup-asr-worker") from error
+
+
+def publish_asr_worker(stage, runtime, recipe):
+    """Never replace existing artifacts, including corrupt same-name collisions."""
+    runtime.mkdir(parents=True, exist_ok=True)
+    _plain_path(runtime, directory=True)
+    name = "asr-worker-" + asr_worker_fingerprint(recipe)
+    child = runtime / name
+    if not child.exists() and not child.is_symlink():
+        # Same-volume staging makes the immutable directory publication atomic.
+        with tempfile.TemporaryDirectory(prefix=".asr-publish-", dir=runtime) as tmp:
+            staged = Path(tmp) / name
+            staged.mkdir()
+            for filename in ASR_WORKER_FILES:
+                _plain_path(stage / filename)
+                shutil.copy2(stage / filename, staged / filename)
+            manifest = {"v": 1, "recipe": recipe, "fingerprint": asr_worker_fingerprint(recipe),
+                        "sha256": {filename: digest(staged / filename) for filename in ASR_WORKER_FILES}}
+            (staged / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            _validate_asr_worker_child(Path(tmp), name, recipe)
+            # os.rename on Windows refuses an existing directory (no overwrite).
+            try:
+                os.rename(staged, child)
+            except FileExistsError:
+                _validate_asr_worker_child(runtime, name, recipe)
+    exe = _validate_asr_worker_child(runtime, name, recipe)
+    pointer = {"v": 1, "directory": name, "manifest_sha256": digest(child / "manifest.json")}
+    pointer_path = runtime / "asr-worker.json"
+    if pointer_path.exists() or pointer_path.is_symlink():
+        _plain_path(pointer_path)
+    fd, temporary = tempfile.mkstemp(prefix=".asr-pointer-", dir=runtime)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            output.write(json.dumps(pointer) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, pointer_path)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
+    return exe
+
+
+def build_asr_worker(work, destination, recipe):
+    source, build = work / "sherpa", work / "build"
+    run(["git", "init", str(source)])
+    run(["git", "-C", str(source), "fetch", "--depth=1", FORK, FORK_REVISION])
+    run(["git", "-C", str(source), "checkout", "--detach", "FETCH_HEAD"])
+    revision = subprocess.check_output(["git", "-C", str(source), "rev-parse", "HEAD"], text=True).strip()
+    if revision != FORK_REVISION:
+        raise RuntimeError("ASR worker fork revision mismatch")
+    for name, expected in recipe["inputs"].items():
+        copied = work / Path(name).name
+        shutil.copy2(ROOT / name, copied)
+        if digest(copied) != expected:
+            raise RuntimeError(f"ASR worker source changed during build: {name}")
+    run(["git", "-C", str(source), "apply", "--check", str(work / "asr-worker.patch")])
+    run(["git", "-C", str(source), "apply", str(work / "asr-worker.patch")])
+    shutil.copy2(work / "asr_worker.cc", source / "sherpa-onnx/csrc/asr_worker.cc")
+    pinned = (source / "cmake/onnxruntime-win-x64-directml.cmake").read_text(encoding="utf-8")
+    for marker in ("microsoft.ml.onnxruntime.directml/1.24.4/", "microsoft.ai.directml/1.15.4/",
+                   "57e9f11b73437bef7a309496135d4c1f96b1a8e9ddba60013fa27bfc1d788681",
+                   "4e7cb7ddce8cf837a7a75dc029209b520ca0101470fcdf275c1f49736a3615b9"):
+        if marker not in pinned:
+            raise RuntimeError("ASR worker dependency pin mismatch")
+    run(["cmake", "-S", str(source), "-B", str(build), "-G", "Visual Studio 17 2022", "-A", "x64",
+         *ASR_WORKER_CMAKE])
+    run(["cmake", "--build", str(build), "--config", "Release", "--target", "asr-worker", "--parallel", "2"])
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ASR_WORKER_FILES:
+        shutil.copy2(build / "bin/Release" / name, destination / name)
+    for name in ASR_WORKER_FILES[1:]:
+        if digest(destination / name) != LEGACY_RUNTIME[name]:
+            raise RuntimeError(f"ASR worker DLL hash mismatch: {name}")
+    for option in ("--help", "--self-test"):
+        subprocess.run([str(destination / "asr-worker.exe"), option], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+
+
+def prepare_asr_worker(runtime):
+    recipe = asr_worker_recipe()
+    try:
+        return asr_worker_path(runtime)
+    except RuntimeError:
+        pass
+    # A valid immutable child can be reused when only its pointer is missing.
+    name = "asr-worker-" + asr_worker_fingerprint(recipe)
+    child = runtime / name
+    if child.exists() or child.is_symlink():
+        _validate_asr_worker_child(runtime, name, recipe)  # Fail closed on collisions.
+        return publish_asr_worker(child, runtime, recipe)
+    # Worker-only must not install/update tools or run any GPU/model checks.
+    for command in ("git", "cmake"):
+        if not shutil.which(command):
+            raise RuntimeError(f"Install {command} and Visual Studio 2022 C++ Build Tools, then run mise run setup-asr-worker")
+    with tempfile.TemporaryDirectory(prefix="asr-worker-build-") as tmp:
+        work = Path(tmp)
+        stage = work / "artifact"
+        build_asr_worker(work, stage, recipe)
+        if asr_worker_recipe() != recipe:
+            raise RuntimeError("ASR worker inputs changed during build; run mise run setup-asr-worker again")
+        return publish_asr_worker(stage, runtime, recipe)
 
 
 def visual_studio():
@@ -161,7 +347,7 @@ def verify_rocm():
 
 
 def verify_directml(runtime, work):
-    import reazonspeech_diarize as app
+    import transcribe as app
     wav = work / "smoke.wav"
     with wave.open(str(wav), "wb") as f:
         f.setparams((1, 2, app.RATE, 0, "NONE", "not compressed"))
@@ -172,10 +358,14 @@ def verify_directml(runtime, work):
     app.recognize(app.segment_wav(wav, work, [segment]), work)
 
 
-def main():
+def main(asr_worker_only=False):
     if os.name != "nt" or sys.version_info[:2] != (3, 12):
         raise RuntimeError("Windows x64 と Python 3.12 が必要です")
+    if asr_worker_only:
+        print(f"ASR worker ready: {prepare_asr_worker(RUNTIME)} (CPU build/help checks only)")
+        return
     ensure_command("ffmpeg", "Gyan.FFmpeg")
+    ensure_command("ffprobe", "Gyan.FFmpeg")
     verify_rocm()
     expected = expected_runtime()
     need_core = not valid_runtime(CORE, expected)
@@ -214,4 +404,7 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--asr-worker-only", action="store_true",
+                        help="Build the additive resident ASR worker; no models or GPU checks")
+    main(asr_worker_only=parser.parse_args().asr_worker_only)
